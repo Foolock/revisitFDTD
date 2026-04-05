@@ -47,7 +47,6 @@ class GDiamondNumpy:
         self._Nz = Nz
         self._N = Nx * Ny * Nz
 
-        # constants: exactly follow C++
         self.PI = np.float32(3.14159265359)
         self.eps0 = np.float32(1.0)
         self.mu0 = np.float32(1.0)
@@ -55,7 +54,6 @@ class GDiamondNumpy:
         self.c0 = np.float32(1.0 / np.sqrt(self.mu0 * self.eps0))
         self.hbar = np.float32(1.0)
 
-        # FDTD parameters
         self.um = np.float32(1.0)
         self.nm = np.float32(self.um / 1.0e3)
 
@@ -74,7 +72,6 @@ class GDiamondNumpy:
 
         self._source_idx = Nx // 2 + (Ny // 2) * Nx + (Nz // 2) * Nx * Ny
 
-        # output field arrays
         self._Ex_seq = np.zeros(self._N, dtype=np.float32)
         self._Ey_seq = np.zeros(self._N, dtype=np.float32)
         self._Ez_seq = np.zeros(self._N, dtype=np.float32)
@@ -82,7 +79,6 @@ class GDiamondNumpy:
         self._Hy_seq = np.zeros(self._N, dtype=np.float32)
         self._Hz_seq = np.zeros(self._N, dtype=np.float32)
 
-        # source/current arrays
         self._Jx = np.zeros(self._N, dtype=np.float32)
         self._Jy = np.zeros(self._N, dtype=np.float32)
         self._Jz = np.zeros(self._N, dtype=np.float32)
@@ -90,7 +86,6 @@ class GDiamondNumpy:
         self._My = np.zeros(self._N, dtype=np.float32)
         self._Mz = np.zeros(self._N, dtype=np.float32)
 
-        # coefficient arrays
         self._Cax = np.zeros(self._N, dtype=np.float32)
         self._Cay = np.zeros(self._N, dtype=np.float32)
         self._Caz = np.zeros(self._N, dtype=np.float32)
@@ -260,7 +255,21 @@ class GDiamondNumpy:
 
         Image.fromarray(img, mode="RGB").save(filename)
 
-    def update_FDTD_seq_figures(self, num_timesteps: int, outdir: str = "numpy_figures"):
+    def _finalize_and_report(self, Ex_temp, Ey_temp, Ez_temp, Hx_temp, Hy_temp, Hz_temp, seq_runtime, num_timesteps):
+        self._Ex_seq[:] = Ex_temp.reshape(-1)
+        self._Ey_seq[:] = Ey_temp.reshape(-1)
+        self._Ez_seq[:] = Ez_temp.reshape(-1)
+        self._Hx_seq[:] = Hx_temp.reshape(-1)
+        self._Hy_seq[:] = Hy_temp.reshape(-1)
+        self._Hz_seq[:] = Hz_temp.reshape(-1)
+
+        print(f"seq runtime (excluding figures output): {seq_runtime}s")
+        print(
+            "seq performance (excluding figures output): "
+            f"{(self._Nx * self._Ny * self._Nz / 1.0e6 * num_timesteps) / seq_runtime} Mcells/s"
+        )
+
+    def update_FDTD_seq_figures_indexing(self, num_timesteps: int, outdir: str):
         if os.path.exists(outdir):
             shutil.rmtree(outdir)
         os.mkdir(outdir)
@@ -288,7 +297,6 @@ class GDiamondNumpy:
             Mz_value = np.float32(self.M_source_amp * np.sin(self.SOURCE_OMEGA * np.float32(t) * self.dt))
             self._Mz[self._source_idx] = Mz_value
 
-            # update E
             for k in range(1, Nz - 1):
                 for j in range(1, Ny - 1):
                     for i in range(1, Nx - 1):
@@ -321,7 +329,6 @@ class GDiamondNumpy:
                             )
                         )
 
-            # update H
             for k in range(1, Nz - 1):
                 for j in range(1, Ny - 1):
                     for i in range(1, Nx - 1):
@@ -359,7 +366,6 @@ class GDiamondNumpy:
 
             if t % record_stride == 0:
                 print(f"Iter: {t} / {num_timesteps}")
-
                 H_time_monitor_xy = np.zeros(Nx * Ny, dtype=np.float32)
                 k_mid = Nz // 2
 
@@ -377,18 +383,139 @@ class GDiamondNumpy:
                     1.0 / math.sqrt(float(self.mu0 / self.eps0))
                 )
 
-        print(f"seq runtime (excluding figures output): {seq_runtime}s")
-        print(
-            "seq performance (excluding figures output): "
-            f"{(Nx * Ny * Nz / 1.0e6 * num_timesteps) / seq_runtime} Mcells/s"
+        self._finalize_and_report(
+            Ex_temp, Ey_temp, Ez_temp, Hx_temp, Hy_temp, Hz_temp, seq_runtime, num_timesteps
         )
 
-        self._Ex_seq[:] = Ex_temp
-        self._Ey_seq[:] = Ey_temp
-        self._Ez_seq[:] = Ez_temp
-        self._Hx_seq[:] = Hx_temp
-        self._Hy_seq[:] = Hy_temp
-        self._Hz_seq[:] = Hz_temp
+    def update_FDTD_seq_figures_vectorized(self, num_timesteps: int, outdir: str):
+        if os.path.exists(outdir):
+            shutil.rmtree(outdir)
+        os.mkdir(outdir)
+        print(f"{outdir} created successfully.")
+
+        Nx = self._Nx
+        Ny = self._Ny
+        Nz = self._Nz
+
+        Ex_temp = np.zeros((Nz, Ny, Nx), dtype=np.float32)
+        Ey_temp = np.zeros((Nz, Ny, Nx), dtype=np.float32)
+        Ez_temp = np.zeros((Nz, Ny, Nx), dtype=np.float32)
+        Hx_temp = np.zeros((Nz, Ny, Nx), dtype=np.float32)
+        Hy_temp = np.zeros((Nz, Ny, Nx), dtype=np.float32)
+        Hz_temp = np.zeros((Nz, Ny, Nx), dtype=np.float32)
+
+        Jx = self._Jx.reshape(Nz, Ny, Nx)
+        Jy = self._Jy.reshape(Nz, Ny, Nx)
+        Jz = self._Jz.reshape(Nz, Ny, Nx)
+        Mx = self._Mx.reshape(Nz, Ny, Nx)
+        My = self._My.reshape(Nz, Ny, Nx)
+        Mz = self._Mz.reshape(Nz, Ny, Nx)
+
+        Cax = self._Cax.reshape(Nz, Ny, Nx)
+        Cay = self._Cay.reshape(Nz, Ny, Nx)
+        Caz = self._Caz.reshape(Nz, Ny, Nx)
+        Cbx = self._Cbx.reshape(Nz, Ny, Nx)
+        Cby = self._Cby.reshape(Nz, Ny, Nx)
+        Cbz = self._Cbz.reshape(Nz, Ny, Nx)
+
+        Dax = self._Dax.reshape(Nz, Ny, Nx)
+        Day = self._Day.reshape(Nz, Ny, Nx)
+        Daz = self._Daz.reshape(Nz, Ny, Nx)
+        Dbx = self._Dbx.reshape(Nz, Ny, Nx)
+        Dby = self._Dby.reshape(Nz, Ny, Nx)
+        Dbz = self._Dbz.reshape(Nz, Ny, Nx)
+
+        core = np.s_[1:Nz-1, 1:Ny-1, 1:Nx-1]
+
+        seq_runtime = 0.0
+        record_stride = max(1, num_timesteps // 10)
+
+        for t in range(num_timesteps):
+            start = time.perf_counter()
+
+            self._Mz.fill(0.0)
+            mz_k = self._source_idx // (Nx * Ny)
+            rem = self._source_idx % (Nx * Ny)
+            mz_j = rem // Nx
+            mz_i = rem % Nx
+            Mz[mz_k, mz_j, mz_i] = np.float32(
+                self.M_source_amp * np.sin(self.SOURCE_OMEGA * np.float32(t) * self.dt)
+            )
+
+            Ex_temp[core] = (
+                Cax[core] * Ex_temp[core]
+                + Cbx[core] * (
+                    (Hz_temp[1:Nz-1, 1:Ny-1, 1:Nx-1] - Hz_temp[1:Nz-1, 0:Ny-2, 1:Nx-1])
+                    - (Hy_temp[1:Nz-1, 1:Ny-1, 1:Nx-1] - Hy_temp[0:Nz-2, 1:Ny-1, 1:Nx-1])
+                    - Jx[core] * self._dx
+                )
+            )
+
+            Ey_temp[core] = (
+                Cay[core] * Ey_temp[core]
+                + Cby[core] * (
+                    (Hx_temp[1:Nz-1, 1:Ny-1, 1:Nx-1] - Hx_temp[0:Nz-2, 1:Ny-1, 1:Nx-1])
+                    - (Hz_temp[1:Nz-1, 1:Ny-1, 1:Nx-1] - Hz_temp[1:Nz-1, 1:Ny-1, 0:Nx-2])
+                    - Jy[core] * self._dx
+                )
+            )
+
+            Ez_temp[core] = (
+                Caz[core] * Ez_temp[core]
+                + Cbz[core] * (
+                    (Hy_temp[1:Nz-1, 1:Ny-1, 1:Nx-1] - Hy_temp[1:Nz-1, 1:Ny-1, 0:Nx-2])
+                    - (Hx_temp[1:Nz-1, 1:Ny-1, 1:Nx-1] - Hx_temp[1:Nz-1, 0:Ny-2, 1:Nx-1])
+                    - Jz[core] * self._dx
+                )
+            )
+
+            Hx_temp[core] = (
+                Dax[core] * Hx_temp[core]
+                + Dbx[core] * (
+                    (Ey_temp[2:Nz, 1:Ny-1, 1:Nx-1] - Ey_temp[1:Nz-1, 1:Ny-1, 1:Nx-1])
+                    - (Ez_temp[1:Nz-1, 2:Ny, 1:Nx-1] - Ez_temp[1:Nz-1, 1:Ny-1, 1:Nx-1])
+                    - Mx[core] * self._dx
+                )
+            )
+
+            Hy_temp[core] = (
+                Day[core] * Hy_temp[core]
+                + Dby[core] * (
+                    (Ez_temp[1:Nz-1, 1:Ny-1, 2:Nx] - Ez_temp[1:Nz-1, 1:Ny-1, 1:Nx-1])
+                    - (Ex_temp[2:Nz, 1:Ny-1, 1:Nx-1] - Ex_temp[1:Nz-1, 1:Ny-1, 1:Nx-1])
+                    - My[core] * self._dx
+                )
+            )
+
+            Hz_temp[core] = (
+                Daz[core] * Hz_temp[core]
+                + Dbz[core] * (
+                    (Ex_temp[1:Nz-1, 2:Ny, 1:Nx-1] - Ex_temp[1:Nz-1, 1:Ny-1, 1:Nx-1])
+                    - (Ey_temp[1:Nz-1, 1:Ny-1, 2:Nx] - Ey_temp[1:Nz-1, 1:Ny-1, 1:Nx-1])
+                    - Mz[core] * self._dx
+                )
+            )
+
+            end = time.perf_counter()
+            seq_runtime += (end - start)
+
+            if t % record_stride == 0:
+                print(f"Iter: {t} / {num_timesteps}")
+                k_mid = Nz // 2
+                H_time_monitor_xy = Hz_temp[k_mid, :, :].reshape(-1).astype(np.float32)
+
+                field_filename = os.path.join(outdir, f"Hz_seq_{t:04d}.png")
+                self.save_field_png(
+                    H_time_monitor_xy,
+                    field_filename,
+                    Nx,
+                    Ny,
+                    1.0 / math.sqrt(float(self.mu0 / self.eps0))
+                )
+
+        self._finalize_and_report(
+            Ex_temp, Ey_temp, Ez_temp, Hx_temp, Hy_temp, Hz_temp, seq_runtime, num_timesteps
+        )
 
     def print_probe(self):
         idx = self._source_idx
@@ -411,10 +538,7 @@ class GDiamondNumpy:
         }
 
     def compare_with_cpp_bin(self, cpp_dir: str = "seq_fields_cpp"):
-        Nx = self._Nx
-        Ny = self._Ny
-        Nz = self._Nz
-        N = Nx * Ny * Nz
+        N = self._Nx * self._Ny * self._Nz
 
         fields_np = {
             "Ex": self._Ex_seq,
@@ -445,31 +569,85 @@ class GDiamondNumpy:
             print(f"{name} max abs err = {max_abs_err:.8e}")
             print(f"{name} rel l2      = {rel_l2:.8e}")
 
+    def compare_with_fields(self, other_fields: dict, tag: str = "other"):
+        my_fields = {
+            "Ex": self._Ex_seq,
+            "Ey": self._Ey_seq,
+            "Ez": self._Ez_seq,
+            "Hx": self._Hx_seq,
+            "Hy": self._Hy_seq,
+            "Hz": self._Hz_seq,
+        }
+
+        for name, arr_self in my_fields.items():
+            arr_other = other_fields[name]
+
+            abs_err = np.abs(arr_self - arr_other)
+            max_abs_err = float(np.max(abs_err))
+
+            other_norm = float(np.linalg.norm(arr_other))
+            rel_l2 = float(np.linalg.norm(arr_self - arr_other) / other_norm) if other_norm != 0.0 else float(np.linalg.norm(arr_self - arr_other))
+
+            print(f"{name} max abs err vs {tag} = {max_abs_err:.8e}")
+            print(f"{name} rel l2      vs {tag} = {rel_l2:.8e}")
+
+    def snapshot_fields(self):
+        return {
+            "Ex": self._Ex_seq.copy(),
+            "Ey": self._Ey_seq.copy(),
+            "Ez": self._Ez_seq.copy(),
+            "Hx": self._Hx_seq.copy(),
+            "Hy": self._Hy_seq.copy(),
+            "Hz": self._Hz_seq.copy(),
+        }
 
 def parse_args():
-    if len(sys.argv) == 5:
-        Nx = int(sys.argv[1])
-        Ny = int(sys.argv[2])
-        Nz = int(sys.argv[3])
-        num_timesteps = int(sys.argv[4])
-    else:
-        print(f"Usage: {sys.argv[0]} Nx Ny Nz num_timesteps")
-        print("Using default: 64 64 64 20")
-        Nx, Ny, Nz, num_timesteps = 64, 64, 64, 20
-    return Nx, Ny, Nz, num_timesteps
+    if len(sys.argv) != 7:
+        print(f"Usage: {sys.argv[0]} Nx Ny Nz num_timesteps mode fig_dir")
+        print("mode must be one of: indexing, vectorized, both")
+        sys.exit(1)
+
+    Nx = int(sys.argv[1])
+    Ny = int(sys.argv[2])
+    Nz = int(sys.argv[3])
+    num_timesteps = int(sys.argv[4])
+    mode = sys.argv[5]
+    fig_dir = sys.argv[6]
+
+    if mode not in ("indexing", "vectorized", "both"):
+        print("mode must be one of: indexing, vectorized, both")
+        sys.exit(1)
+
+    return Nx, Ny, Nz, num_timesteps, mode, fig_dir
 
 
 def main():
-    Nx, Ny, Nz, num_timesteps = parse_args()
+    Nx, Ny, Nz, num_timesteps, mode, fig_dir = parse_args()
 
     sim = GDiamondNumpy(Nx, Ny, Nz)
-    sim.update_FDTD_seq_figures(num_timesteps, outdir="numpy_figures")
-    sim.print_probe()
-    print("max abs fields =", sim.max_abs_field())
 
-    print("\nComparing against C++ binary in seq_fields_cpp/")
-    sim.compare_with_cpp_bin("seq_fields_cpp")
+    if mode == "indexing":
+        sim.update_FDTD_seq_figures_indexing(num_timesteps, outdir=fig_dir)
 
+    elif mode == "vectorized":
+        sim.update_FDTD_seq_figures_vectorized(num_timesteps, outdir=fig_dir)
+
+    else:
+        # run indexing first
+        sim.update_FDTD_seq_figures_indexing(num_timesteps, outdir=fig_dir + "_indexing")
+        indexing_fields = sim.snapshot_fields()
+
+        # new simulator for vectorized
+        sim_vec = GDiamondNumpy(Nx, Ny, Nz)
+        sim_vec.update_FDTD_seq_figures_vectorized(num_timesteps, outdir=fig_dir + "_vectorized")
+
+        print("\nComparing vectorized against indexing")
+        sim_vec.compare_with_fields(indexing_fields, tag="indexing")
+
+        print("\nComparing vectorized against C++ binary in seq_fields_cpp/")
+        sim_vec.compare_with_cpp_bin("seq_fields_cpp")
+
+        return
 
 if __name__ == "__main__":
     main()
