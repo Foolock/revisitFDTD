@@ -368,7 +368,6 @@ class GDiamondNumpy:
     for t in range(num_timesteps):
       start = time.perf_counter()
 
-      self._Mz.fill(0.0)
       Mz_value = np.float32(self.M_source_amp * np.sin(self.SOURCE_OMEGA * np.float32(t) * self.dt))
       self._Mz[self._source_idx] = Mz_value
 
@@ -508,7 +507,6 @@ class GDiamondNumpy:
     for t in range(num_timesteps):
       start = time.perf_counter()
 
-      self._Mz.fill(0.0)
       mz_k = self._source_idx // (Nx * Ny)
       rem = self._source_idx % (Nx * Ny)
       mz_j = rem // Nx
@@ -646,7 +644,6 @@ class GDiamondNumpy:
     for t in range(num_timesteps):
       start = time.perf_counter()
 
-      Mz.fill(cp.float32(0.0))
       Mz[mz_k, mz_j, mz_i] = cp.float32(
         self.M_source_amp * np.sin(self.SOURCE_OMEGA * np.float32(t) * self.dt)
       )

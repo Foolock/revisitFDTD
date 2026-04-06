@@ -319,7 +319,6 @@ public:
     for(size_t t = 0; t < num_timesteps; ++t) {
       auto start = std::chrono::high_resolution_clock::now();
 
-      std::fill(_Mz.begin(), _Mz.end(), 0.0f);
       float Mz_value = M_source_amp * std::sin(SOURCE_OMEGA * static_cast<float>(t) * dt);
       _Mz[_source_idx] = Mz_value;
 

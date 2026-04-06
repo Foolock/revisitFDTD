@@ -448,8 +448,6 @@ public:
     for(size_t t = 0; t < num_timesteps; ++t) {
       auto start_step = std::chrono::high_resolution_clock::now();
 
-      cudaMemset(Mz, 0, sizeof(float) * _Nx * _Ny * _Nz);
-
       float Mz_value = M_source_amp * sinf(SOURCE_OMEGA * static_cast<float>(t) * dt);
       cudaMemcpy(Mz + _source_idx, &Mz_value, sizeof(float), cudaMemcpyHostToDevice);
 
