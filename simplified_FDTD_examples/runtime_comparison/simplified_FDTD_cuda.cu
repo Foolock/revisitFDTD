@@ -68,62 +68,6 @@ public:
   }
 };
 
-static void save_field_png(float* u, const char filename[], int Nx, int Ny, float vmax) {
-  unsigned char* img = (unsigned char*)std::malloc(Nx * Ny * 3 * sizeof(unsigned char));
-  if(img == nullptr) {
-    std::perror("Failed to allocate memory for img");
-    return;
-  }
-
-  for(int i = 0; i < Nx; ++i) {
-    for(int j = 0; j < Ny; ++j) {
-      int idx_field = i + j * Nx;
-      int idx_img = idx_field * 3;
-
-      float value = u[idx_field] / vmax;
-
-      unsigned char red, green, blue;
-
-      if(value >= 0.0f) {
-        if(value > 1.0f) value = 1.0f;
-        red = 255;
-        green = blue = static_cast<unsigned char>(255.0f * (1.0f - value));
-      }
-      else {
-        if(value < -1.0f) value = -1.0f;
-        blue = 255;
-        red = green = static_cast<unsigned char>(255.0f * (1.0f + value));
-      }
-
-      img[idx_img + 0] = red;
-      img[idx_img + 1] = green;
-      img[idx_img + 2] = blue;
-    }
-  }
-
-  if(stbi_write_png(filename, Nx, Ny, 3, img, Nx * 3) == 0) {
-    std::perror("Failed to write image");
-  }
-
-  std::free(img);
-}
-
-static void write_binary_field(const std::string& filename, const std::vector<float>& data) {
-  std::ofstream ofs(filename, std::ios::binary);
-  if(!ofs) {
-    std::cerr << "Failed to open " << filename << " for writing.\n";
-    std::exit(EXIT_FAILURE);
-  }
-
-  ofs.write(reinterpret_cast<const char*>(data.data()),
-            static_cast<std::streamsize>(data.size() * sizeof(float)));
-
-  if(!ofs) {
-    std::cerr << "Failed to write " << filename << ".\n";
-    std::exit(EXIT_FAILURE);
-  }
-}
-
 static void set_FDTD_matrices_3D_structure(
   std::vector<float>& Cax, std::vector<float>& Cbx,
   std::vector<float>& Cay, std::vector<float>& Cby,
@@ -336,8 +280,6 @@ public:
 
     _source_idx = Nx / 2 + (Ny / 2) * Nx + (Nz / 2) * Nx * Ny;
 
-    std::cerr << "initializing Ca, Cb, Da, Db...\n";
-
     bool* mask = (bool*)std::malloc(Nx * Ny * sizeof(bool));
     std::memset(mask, 0, Nx * Ny * sizeof(bool));
 
@@ -362,21 +304,11 @@ public:
     );
 
     std::free(mask);
-    std::cerr << "finish initialization\n";
   }
 
-  void update_FDTD_gpu_figures(size_t num_timesteps) {
-    const std::string figdir = "gpu_figures_cpp";
-
-    std::filesystem::remove_all(figdir);
-    if(!std::filesystem::create_directory(figdir)) {
-      std::cerr << "failed to create " << figdir << "\n";
-      std::exit(EXIT_FAILURE);
-    }
-    std::cerr << figdir << " created successfully.\n";
+  void update_FDTD_gpu(size_t num_timesteps) {
 
     const size_t N = _Nx * _Ny * _Nz;
-    const size_t Nxy = _Nx * _Ny;
 
     float *Ex, *Ey, *Ez, *Hx, *Hy, *Hz;
     float *Jx, *Jy, *Jz, *Mx, *My, *Mz;
@@ -421,9 +353,9 @@ public:
     CUDACHECK(cudaMemset(My, 0, sizeof(float) * N));
     CUDACHECK(cudaMemset(Mz, 0, sizeof(float) * N));
 
-    std::chrono::duration<double> gpu_runtime(0.0);
+    std::chrono::duration<double> h2d_runtime(0.0);
+    auto h2d_start = std::chrono::high_resolution_clock::now();
 
-    auto start = std::chrono::high_resolution_clock::now();
     CUDACHECK(cudaMemcpy(Cax, _Cax.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
     CUDACHECK(cudaMemcpy(Cay, _Cay.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
     CUDACHECK(cudaMemcpy(Caz, _Caz.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
@@ -436,17 +368,19 @@ public:
     CUDACHECK(cudaMemcpy(Dbx, _Dbx.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
     CUDACHECK(cudaMemcpy(Dby, _Dby.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
     CUDACHECK(cudaMemcpy(Dbz, _Dbz.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
-    auto end = std::chrono::high_resolution_clock::now();
-    gpu_runtime += end - start;
+
+    // no need to synchronize as we are using blocking memcpy
+
+    auto h2d_end = std::chrono::high_resolution_clock::now();
+    h2d_runtime += h2d_end - h2d_start;
 
     size_t block_size = BLOCK_SIZE;
     size_t grid_size = (N + block_size - 1) / block_size;
-    size_t record_stride = std::max<size_t>(1, num_timesteps / 10);
 
-    std::vector<float> Ex_slice(Nxy, 0.0f);
+    std::chrono::duration<double> kernel_runtime(0.0);
+    auto kernel_start = std::chrono::high_resolution_clock::now();
 
     for(size_t t = 0; t < num_timesteps; ++t) {
-      auto start_step = std::chrono::high_resolution_clock::now();
 
       float Mz_value = M_source_amp * sinf(SOURCE_OMEGA * static_cast<float>(t) * dt);
       cudaMemcpy(Mz + _source_idx, &Mz_value, sizeof(float), cudaMemcpyHostToDevice);
@@ -458,7 +392,6 @@ public:
         Jx, Jy, Jz,
         _dx, static_cast<int>(_Nx), static_cast<int>(_Ny), static_cast<int>(_Nz)
       );
-      CUDACHECK(cudaGetLastError());
 
       updateH_3Dmap_fix<<<grid_size, block_size>>>(
         Ex, Ey, Ez,
@@ -467,45 +400,45 @@ public:
         Mx, My, Mz,
         _dx, static_cast<int>(_Nx), static_cast<int>(_Ny), static_cast<int>(_Nz)
       );
-      CUDACHECK(cudaGetLastError());
-      CUDACHECK(cudaDeviceSynchronize());
 
-      auto end_step = std::chrono::high_resolution_clock::now();
-      gpu_runtime += end_step - start_step;
-
-      if(t % record_stride == 0) {
-        std::printf("Iter: %zu / %zu\n", t, num_timesteps);
-
-        const size_t k_mid = _Nz / 2;
-        for(size_t j = 0; j < _Ny; ++j) {
-          float* device_ptr = Ex + j * _Nx + k_mid * Nxy;
-          float* host_ptr = Ex_slice.data() + j * _Nx;
-          CUDACHECK(cudaMemcpy(host_ptr, device_ptr, _Nx * sizeof(float), cudaMemcpyDeviceToHost));
-        }
-
-        char field_filename[256];
-        std::snprintf(field_filename, sizeof(field_filename),
-                      "%s/Ex_gpu_%04zu.png", figdir.c_str(), t);
-        save_field_png(Ex_slice.data(), field_filename,
-                       static_cast<int>(_Nx), static_cast<int>(_Ny), 1.0f);
-      }
     }
 
-    start = std::chrono::high_resolution_clock::now();
+    CUDACHECK(cudaDeviceSynchronize());
+    auto kernel_end = std::chrono::high_resolution_clock::now();
+    kernel_runtime += kernel_end - kernel_start;
+
+    std::chrono::duration<double> d2h_runtime(0.0);
+    auto d2h_start = std::chrono::high_resolution_clock::now();
+
     CUDACHECK(cudaMemcpy(_Ex_gpu.data(), Ex, sizeof(float) * N, cudaMemcpyDeviceToHost));
     CUDACHECK(cudaMemcpy(_Ey_gpu.data(), Ey, sizeof(float) * N, cudaMemcpyDeviceToHost));
     CUDACHECK(cudaMemcpy(_Ez_gpu.data(), Ez, sizeof(float) * N, cudaMemcpyDeviceToHost));
     CUDACHECK(cudaMemcpy(_Hx_gpu.data(), Hx, sizeof(float) * N, cudaMemcpyDeviceToHost));
     CUDACHECK(cudaMemcpy(_Hy_gpu.data(), Hy, sizeof(float) * N, cudaMemcpyDeviceToHost));
     CUDACHECK(cudaMemcpy(_Hz_gpu.data(), Hz, sizeof(float) * N, cudaMemcpyDeviceToHost));
-    end = std::chrono::high_resolution_clock::now();
-    gpu_runtime += end - start;
 
-    std::cout << "gpu runtime (excluding figures output): "
-              << gpu_runtime.count() << "s\n";
-    std::cout << "gpu performance (excluding figures output): "
-              << (_Nx * _Ny * _Nz / 1.0e6 * num_timesteps) / gpu_runtime.count()
+    auto d2h_end = std::chrono::high_resolution_clock::now();
+    d2h_runtime += d2h_end - d2h_start;
+
+    std::chrono::duration<double> total_runtime(0.0);
+    total_runtime = h2d_runtime + kernel_runtime + d2h_runtime;
+
+    std::cout << "end to end throughput: "
+              << (_Nx * _Ny * _Nz / 1.0e6 * num_timesteps) / total_runtime.count()
               << " Mcells/s\n";
+    std::cout << "kernel throughput: "
+              << (_Nx * _Ny * _Nz / 1.0e6 * num_timesteps) / kernel_runtime.count()
+              << " Mcells/s\n";
+
+    double total_s  = total_runtime.count();
+    double h2d_s    = h2d_runtime.count();
+    double kernel_s = kernel_runtime.count();
+    double d2h_s    = d2h_runtime.count();
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "runtime breakdown (%):\n";
+    std::cout << "  H2D memcpy : " << (100.0 * h2d_s / total_s) << "%\n";
+    std::cout << "  kernels    : " << (100.0 * kernel_s / total_s) << "%\n";
+    std::cout << "  D2H memcpy : " << (100.0 * d2h_s / total_s) << "%\n";
 
     CUDACHECK(cudaFree(Ex));
     CUDACHECK(cudaFree(Ey));
@@ -531,23 +464,6 @@ public:
     CUDACHECK(cudaFree(Dby));
     CUDACHECK(cudaFree(Daz));
     CUDACHECK(cudaFree(Dbz));
-  }
-
-  void dump_fields_binary(const std::string& outdir = "gpu_fields_cpp") const {
-    std::filesystem::remove_all(outdir);
-    if(!std::filesystem::create_directory(outdir)) {
-      std::cerr << "failed to create " << outdir << ".\n";
-      std::exit(EXIT_FAILURE);
-    }
-
-    write_binary_field(outdir + "/Ex_gpu.bin", _Ex_gpu);
-    write_binary_field(outdir + "/Ey_gpu.bin", _Ey_gpu);
-    write_binary_field(outdir + "/Ez_gpu.bin", _Ez_gpu);
-    write_binary_field(outdir + "/Hx_gpu.bin", _Hx_gpu);
-    write_binary_field(outdir + "/Hy_gpu.bin", _Hy_gpu);
-    write_binary_field(outdir + "/Hz_gpu.bin", _Hz_gpu);
-
-    std::cout << "saved final fields to " << outdir << "/\n";
   }
 
 private:
@@ -581,10 +497,10 @@ private:
 };
 
 int main(int argc, char** argv) {
-  size_t Nx = 64;
-  size_t Ny = 64;
-  size_t Nz = 64;
-  size_t num_timesteps = 20;
+  size_t Nx = 32;
+  size_t Ny = 32;
+  size_t Nz = 32;
+  size_t num_timesteps = 100;
 
   if(argc == 5) {
     Nx = static_cast<size_t>(std::stoul(argv[1]));
@@ -594,12 +510,11 @@ int main(int argc, char** argv) {
   }
   else {
     std::cout << "Usage: " << argv[0] << " Nx Ny Nz num_timesteps\n";
-    std::cout << "Using default: 64 64 64 20\n";
+    std::cout << "Using default: 32 32 32 100\n";
   }
 
   gDiamondGPU sim(Nx, Ny, Nz);
-  sim.update_FDTD_gpu_figures(num_timesteps);
-  sim.dump_fields_binary("gpu_fields_cpp");
+  sim.update_FDTD_gpu(num_timesteps);
 
   return 0;
 }
