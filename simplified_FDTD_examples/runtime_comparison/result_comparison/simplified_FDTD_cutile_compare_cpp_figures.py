@@ -6,6 +6,7 @@ import importlib.util
 from dataclasses import dataclass
 
 import numpy as np
+from PIL import Image
 
 try:
   import cupy as cp
@@ -555,6 +556,124 @@ class GDiamondCuTileCUDAStyle:
     print(f"  kernels    : {100.0 * kernel_s / total_s:.2f}%")
     print(f"  D2H memcpy : {100.0 * d2h_s / total_s:.2f}%")
 
+  def save_field_png(self, u: np.ndarray, filename: str, Nx: int, Ny: int, vmax: float):
+    img = np.empty((Ny, Nx, 3), dtype=np.uint8)
+
+    for i in range(Nx):
+      for j in range(Ny):
+        idx_field = i + j * Nx
+        value = float(u[idx_field]) / float(vmax)
+
+        if value >= 0.0:
+          if value > 1.0:
+            value = 1.0
+          red = 255
+          green = int(255.0 * (1.0 - value))
+          blue = int(255.0 * (1.0 - value))
+        else:
+          if value < -1.0:
+            value = -1.0
+          blue = 255
+          red = int(255.0 * (1.0 + value))
+          green = int(255.0 * (1.0 + value))
+
+        img[j, i, 0] = red
+        img[j, i, 1] = green
+        img[j, i, 2] = blue
+
+    Image.fromarray(img, mode="RGB").save(filename)
+
+  def generate_figures(self, num_timesteps: int, fig_dir: str, tile_size: int = 256):
+    if tile_size <= 0 or (tile_size & (tile_size - 1)) != 0:
+      raise ValueError("tile_size must be a positive power of two.")
+
+    if os.path.exists(fig_dir):
+      shutil.rmtree(fig_dir)
+    os.mkdir(fig_dir)
+    print(f"{fig_dir} created successfully.")
+
+    N = self._N
+    Nx, Ny, Nz = self._Nx, self._Ny, self._Nz
+    grid = (int(ct.cdiv(N, tile_size)), 1, 1)
+    stream = cp.cuda.get_current_stream()
+
+    Ex = cp.zeros(N, dtype=cp.float32)
+    Ey = cp.zeros(N, dtype=cp.float32)
+    Ez = cp.zeros(N, dtype=cp.float32)
+    Hx = cp.zeros(N, dtype=cp.float32)
+    Hy = cp.zeros(N, dtype=cp.float32)
+    Hz = cp.zeros(N, dtype=cp.float32)
+
+    Jx = cp.zeros(N, dtype=cp.float32)
+    Jy = cp.zeros(N, dtype=cp.float32)
+    Jz = cp.zeros(N, dtype=cp.float32)
+    Mx = cp.zeros(N, dtype=cp.float32)
+    My = cp.zeros(N, dtype=cp.float32)
+    Mz = cp.zeros(N, dtype=cp.float32)
+
+    Cax = cp.asarray(self._Cax)
+    Cay = cp.asarray(self._Cay)
+    Caz = cp.asarray(self._Caz)
+    Cbx = cp.asarray(self._Cbx)
+    Cby = cp.asarray(self._Cby)
+    Cbz = cp.asarray(self._Cbz)
+
+    Dax = cp.asarray(self._Dax)
+    Day = cp.asarray(self._Day)
+    Daz = cp.asarray(self._Daz)
+    Dbx = cp.asarray(self._Dbx)
+    Dby = cp.asarray(self._Dby)
+    Dbz = cp.asarray(self._Dbz)
+
+    mz_idx = int(self._source_idx)
+    record_stride = max(1, num_timesteps // 10)
+
+    for t in range(num_timesteps):
+      mz_value = np.float32(self.M_source_amp * np.sin(self.SOURCE_OMEGA * np.float32(t) * self.dt))
+      Mz[mz_idx] = cp.float32(mz_value)
+
+      ct.launch(
+        stream, grid,
+        update_e_kernel_inplace,
+        (
+          Ex, Ey, Ez, Hx, Hy, Hz,
+          Cax, Cbx, Cay, Cby, Caz, Cbz,
+          Jx, Jy, Jz,
+          float(self._dx),
+          Nx, Ny, Nz,
+          tile_size,
+        ),
+      )
+
+      ct.launch(
+        stream, grid,
+        update_h_kernel_inplace,
+        (
+          Ex, Ey, Ez, Hx, Hy, Hz,
+          Dax, Dbx, Day, Dby, Daz, Dbz,
+          Mx, My, Mz,
+          float(self._dx),
+          Nx, Ny, Nz,
+          tile_size,
+        ),
+      )
+
+      stream.synchronize()
+
+      # if t % record_stride == 0:
+      #   print(f"Iter: {t} / {num_timesteps}")
+      #   k_mid = Nz // 2
+      #   ex_mid = cp.asnumpy(Ex[k_mid * Nx * Ny:(k_mid + 1) * Nx * Ny])
+      #   field_filename = os.path.join(fig_dir, f"Ex_cutile_{t:04d}.png")
+      #   self.save_field_png(ex_mid, field_filename, Nx, Ny, 1.0)
+      if t % record_stride == 0:
+        print(f"Iter: {t} / {num_timesteps}")
+        k_mid = Nz // 2
+        hz_mid = cp.asnumpy(Hz[k_mid * Nx * Ny:(k_mid + 1) * Nx * Ny])
+        field_filename = os.path.join(fig_dir, f"Hz_cutile_{t:04d}.png")
+        self.save_field_png(hz_mid, field_filename, Nx, Ny, 1.0 / np.sqrt(self.mu0 / self.eps0))
+
+
   def compare_with_numpy_vectorized(self, ref_module_path: str, num_timesteps: int):
     if not os.path.exists(ref_module_path):
       raise FileNotFoundError(f"Cannot find NumPy reference script: {ref_module_path}")
@@ -697,6 +816,36 @@ class GDiamondCuTileCUDAStyle:
       print(f"{name} rel l2      = {rel_l2:.8e}")
 
 
+
+  def compare_with_cpp_bin(self, cpp_dir: str):
+    cur_fields = {
+      "Ex": self._Ex_host,
+      "Ey": self._Ey_host,
+      "Ez": self._Ez_host,
+      "Hx": self._Hx_host,
+      "Hy": self._Hy_host,
+      "Hz": self._Hz_host,
+    }
+
+    print("\nComparing cuTile result against CUDA C++ binary output")
+    for name in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz"):
+      path = os.path.join(cpp_dir, f"{name}.bin")
+      if not os.path.exists(path):
+        raise FileNotFoundError(f"Cannot find C++ field file: {path}")
+
+      ref = np.fromfile(path, dtype=np.float32)
+      if ref.size != self._N:
+        raise RuntimeError(f"{path} size mismatch: got {ref.size}, expected {self._N}")
+
+      cur = cur_fields[name]
+      abs_err = np.abs(ref - cur)
+      max_abs_err = float(np.max(abs_err))
+      ref_norm = float(np.linalg.norm(ref))
+      rel_l2 = float(np.linalg.norm(ref - cur) / ref_norm) if ref_norm != 0.0 else float(np.linalg.norm(ref - cur))
+      print(f"{name} max abs err = {max_abs_err:.8e}")
+      print(f"{name} rel l2      = {rel_l2:.8e}")
+
+
 def parse_args():
   parser = argparse.ArgumentParser(description="cuTile version updated to follow the uploaded CUDA C++ semantics.")
   parser.add_argument("Nx", type=int)
@@ -705,6 +854,8 @@ def parse_args():
   parser.add_argument("num_timesteps", type=int)
   parser.add_argument("--tile-size", type=int, default=256)
   parser.add_argument("--numpy-ref", type=str, default=None)
+  parser.add_argument("--cpp-bin-dir", type=str, default=None)
+  parser.add_argument("--fig-dir", type=str, default=None)
   parser.add_argument("--no-warmup", action="store_true")
   return parser.parse_args()
 
@@ -715,6 +866,10 @@ def main():
   sim.run_cutile_cuda_style(args.num_timesteps, tile_size=args.tile_size, warmup=(not args.no_warmup))
   if args.numpy_ref:
     sim.compare_with_numpy_vectorized(args.numpy_ref, args.num_timesteps)
+  if args.cpp_bin_dir:
+    sim.compare_with_cpp_bin(args.cpp_bin_dir)
+  if args.fig_dir:
+    sim.generate_figures(args.num_timesteps, args.fig_dir, tile_size=args.tile_size)
 
 
 if __name__ == "__main__":

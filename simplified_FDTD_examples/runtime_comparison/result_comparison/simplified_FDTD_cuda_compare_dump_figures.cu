@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -13,7 +14,7 @@
 #include <cuda_runtime.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "utils/stb_image_write.h"
+#include "../utils/stb_image_write.h"
 
 #define PI 3.14159265359f
 
@@ -196,6 +197,60 @@ static void set_FDTD_matrices_3D_structure(
   }
 }
 
+
+static void save_field_png(float* u, const char filename[], int Nx, int Ny, float vmax) {
+  unsigned char* img = (unsigned char*)std::malloc(Nx * Ny * 3 * sizeof(unsigned char));
+  if(img == nullptr) {
+    std::perror("Failed to allocate memory for img");
+    return;
+  }
+
+  for(int i = 0; i < Nx; ++i) {
+    for(int j = 0; j < Ny; ++j) {
+      int idx_field = i + j * Nx;
+      int idx_img = idx_field * 3;
+
+      float value = u[idx_field] / vmax;
+
+      unsigned char red, green, blue;
+
+      if(value >= 0.0f) {
+        if(value > 1.0f) value = 1.0f;
+        red = 255;
+        green = blue = static_cast<unsigned char>(255.0f * (1.0f - value));
+      }
+      else {
+        if(value < -1.0f) value = -1.0f;
+        blue = 255;
+        red = green = static_cast<unsigned char>(255.0f * (1.0f + value));
+      }
+
+      img[idx_img + 0] = red;
+      img[idx_img + 1] = green;
+      img[idx_img + 2] = blue;
+    }
+  }
+
+  if(stbi_write_png(filename, Nx, Ny, 3, img, Nx * 3) == 0) {
+    std::perror("Failed to write image");
+  }
+
+  std::free(img);
+}
+
+static void dump_field_bin(const std::string& path, const std::vector<float>& data) {
+  std::ofstream ofs(path, std::ios::binary);
+  if(!ofs) {
+    std::cerr << "Failed to open output file: " << path << "\n";
+    std::exit(EXIT_FAILURE);
+  }
+  ofs.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(float)));
+  if(!ofs) {
+    std::cerr << "Failed to write output file: " << path << "\n";
+    std::exit(EXIT_FAILURE);
+  }
+}
+
 __global__ void updateE_3Dmap_fix(float *Ex, float *Ey, float *Ez,
                                   float *Hx, float *Hy, float *Hz,
                                   float *Cax, float *Cbx, float *Cay,
@@ -306,7 +361,7 @@ public:
     std::free(mask);
   }
 
-  void update_FDTD_gpu(size_t num_timesteps) {
+  void update_FDTD_gpu(size_t num_timesteps, const std::string& outdir = "cpp_fields") {
 
     const size_t N = _Nx * _Ny * _Nz;
 
@@ -440,6 +495,165 @@ public:
     std::cout << "  kernels    : " << (100.0 * kernel_s / total_s) << "%\n";
     std::cout << "  D2H memcpy : " << (100.0 * d2h_s / total_s) << "%\n";
 
+
+
+    std::filesystem::create_directories(outdir);
+    dump_field_bin(outdir + "/Ex.bin", _Ex_gpu);
+    dump_field_bin(outdir + "/Ey.bin", _Ey_gpu);
+    dump_field_bin(outdir + "/Ez.bin", _Ez_gpu);
+    dump_field_bin(outdir + "/Hx.bin", _Hx_gpu);
+    dump_field_bin(outdir + "/Hy.bin", _Hy_gpu);
+    dump_field_bin(outdir + "/Hz.bin", _Hz_gpu);
+
+    CUDACHECK(cudaFree(Ex));
+    CUDACHECK(cudaFree(Ey));
+    CUDACHECK(cudaFree(Ez));
+    CUDACHECK(cudaFree(Hx));
+    CUDACHECK(cudaFree(Hy));
+    CUDACHECK(cudaFree(Hz));
+    CUDACHECK(cudaFree(Jx));
+    CUDACHECK(cudaFree(Jy));
+    CUDACHECK(cudaFree(Jz));
+    CUDACHECK(cudaFree(Mx));
+    CUDACHECK(cudaFree(My));
+    CUDACHECK(cudaFree(Mz));
+    CUDACHECK(cudaFree(Cax));
+    CUDACHECK(cudaFree(Cbx));
+    CUDACHECK(cudaFree(Cay));
+    CUDACHECK(cudaFree(Cby));
+    CUDACHECK(cudaFree(Caz));
+    CUDACHECK(cudaFree(Cbz));
+    CUDACHECK(cudaFree(Dax));
+    CUDACHECK(cudaFree(Dbx));
+    CUDACHECK(cudaFree(Day));
+    CUDACHECK(cudaFree(Dby));
+    CUDACHECK(cudaFree(Daz));
+    CUDACHECK(cudaFree(Dbz));
+  }
+
+  void generate_figures(size_t num_timesteps, const std::string& figdir = "cpp_figures") {
+    const size_t N = _Nx * _Ny * _Nz;
+    const size_t Nxy = _Nx * _Ny;
+
+    std::filesystem::remove_all(figdir);
+    if(!std::filesystem::create_directory(figdir)) {
+      std::cerr << "failed to create " << figdir << "\n";
+      std::exit(EXIT_FAILURE);
+    }
+    std::cerr << figdir << " created successfully.\n";
+
+    float *Ex, *Ey, *Ez, *Hx, *Hy, *Hz;
+    float *Jx, *Jy, *Jz, *Mx, *My, *Mz;
+    float *Cax, *Cbx, *Cay, *Cby, *Caz, *Cbz;
+    float *Dax, *Dbx, *Day, *Dby, *Daz, *Dbz;
+
+    CUDACHECK(cudaMalloc(&Ex, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Ey, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Ez, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Hx, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Hy, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Hz, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Jx, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Jy, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Jz, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Mx, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&My, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Mz, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Cax, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Cbx, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Cay, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Cby, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Caz, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Cbz, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Dax, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Dbx, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Day, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Dby, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Daz, sizeof(float) * N));
+    CUDACHECK(cudaMalloc(&Dbz, sizeof(float) * N));
+
+    CUDACHECK(cudaMemset(Ex, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(Ey, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(Ez, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(Hx, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(Hy, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(Hz, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(Jx, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(Jy, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(Jz, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(Mx, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(My, 0, sizeof(float) * N));
+    CUDACHECK(cudaMemset(Mz, 0, sizeof(float) * N));
+
+    CUDACHECK(cudaMemcpy(Cax, _Cax.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Cay, _Cay.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Caz, _Caz.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Cbx, _Cbx.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Cby, _Cby.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Cbz, _Cbz.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Dax, _Dax.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Day, _Day.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Daz, _Daz.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Dbx, _Dbx.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Dby, _Dby.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(Dbz, _Dbz.data(), sizeof(float) * N, cudaMemcpyHostToDevice));
+
+    size_t block_size = BLOCK_SIZE;
+    size_t grid_size = (N + block_size - 1) / block_size;
+    size_t record_stride = std::max<size_t>(1, num_timesteps / 10);
+
+    // std::vector<float> Ex_slice(Nxy, 0.0f);
+    std::vector<float> Hz_slice(Nxy, 0.0f);
+
+    for(size_t t = 0; t < num_timesteps; ++t) {
+      float Mz_value = M_source_amp * sinf(SOURCE_OMEGA * static_cast<float>(t) * dt);
+      cudaMemcpy(Mz + _source_idx, &Mz_value, sizeof(float), cudaMemcpyHostToDevice);
+
+      updateE_3Dmap_fix<<<grid_size, block_size>>>(
+        Ex, Ey, Ez, Hx, Hy, Hz, Cax, Cbx, Cay, Cby, Caz, Cbz, Jx, Jy, Jz,
+        _dx, static_cast<int>(_Nx), static_cast<int>(_Ny), static_cast<int>(_Nz));
+
+      updateH_3Dmap_fix<<<grid_size, block_size>>>(
+        Ex, Ey, Ez, Hx, Hy, Hz, Dax, Dbx, Day, Dby, Daz, Dbz, Mx, My, Mz,
+        _dx, static_cast<int>(_Nx), static_cast<int>(_Ny), static_cast<int>(_Nz));
+
+      CUDACHECK(cudaDeviceSynchronize());
+
+      // if(t % record_stride == 0) {
+      //   std::printf("Iter: %zu / %zu\n", t, num_timesteps);
+
+      //   const size_t k_mid = _Nz / 2;
+      //   for(size_t j = 0; j < _Ny; ++j) {
+      //     float* device_ptr = Ex + j * _Nx + k_mid * Nxy;
+      //     float* host_ptr = Ex_slice.data() + j * _Nx;
+      //     CUDACHECK(cudaMemcpy(host_ptr, device_ptr, _Nx * sizeof(float), cudaMemcpyDeviceToHost));
+      //   }
+
+      //   char field_filename[256];
+      //   std::snprintf(field_filename, sizeof(field_filename),
+      //                 "%s/Ex_gpu_%04zu.png", figdir.c_str(), t);
+      //   save_field_png(Ex_slice.data(), field_filename,
+      //                  static_cast<int>(_Nx), static_cast<int>(_Ny), 1.0f);
+      // }
+      if(t % record_stride == 0) {
+        std::printf("Iter: %zu / %zu\n", t, num_timesteps);
+
+        const size_t k_mid = _Nz / 2;
+        for(size_t j = 0; j < _Ny; ++j) {
+          float* device_ptr = Hz + j * _Nx + k_mid * Nxy;
+          float* host_ptr = Hz_slice.data() + j * _Nx;
+          CUDACHECK(cudaMemcpy(host_ptr, device_ptr, _Nx * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+
+        char field_filename[256];
+        std::snprintf(field_filename, sizeof(field_filename),
+                      "%s/Hz_gpu_%04zu.png", figdir.c_str(), t);
+        save_field_png(Hz_slice.data(), field_filename,
+                       static_cast<int>(_Nx), static_cast<int>(_Ny),
+                       1.0f / std::sqrt(mu0 / eps0));
+      }
+    }
+
     CUDACHECK(cudaFree(Ex));
     CUDACHECK(cudaFree(Ey));
     CUDACHECK(cudaFree(Ez));
@@ -501,20 +715,31 @@ int main(int argc, char** argv) {
   size_t Ny = 32;
   size_t Nz = 32;
   size_t num_timesteps = 100;
+  std::string outdir = "cpp_fields";
+  std::string figdir = "";
 
-  if(argc == 5) {
+  if(argc == 5 || argc == 6 || argc == 7) {
     Nx = static_cast<size_t>(std::stoul(argv[1]));
     Ny = static_cast<size_t>(std::stoul(argv[2]));
     Nz = static_cast<size_t>(std::stoul(argv[3]));
     num_timesteps = static_cast<size_t>(std::stoul(argv[4]));
+    if(argc >= 6) {
+      outdir = argv[5];
+    }
+    if(argc == 7) {
+      figdir = argv[6];
+    }
   }
   else {
-    std::cout << "Usage: " << argv[0] << " Nx Ny Nz num_timesteps\n";
-    std::cout << "Using default: 32 32 32 100\n";
+    std::cout << "Usage: " << argv[0] << " Nx Ny Nz num_timesteps [outdir] [figdir]\n";
+    std::cout << "Using default: 32 32 32 100 cpp_fields\n";
   }
 
   gDiamondGPU sim(Nx, Ny, Nz);
-  sim.update_FDTD_gpu(num_timesteps);
+  sim.update_FDTD_gpu(num_timesteps, outdir);
+  if(!figdir.empty()) {
+    sim.generate_figures(num_timesteps, figdir);
+  }
 
   return 0;
 }
